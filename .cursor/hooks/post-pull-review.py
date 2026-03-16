@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Cursor Hook: Pull 后呈现团队变更。
+Hook: Pull 后呈现团队变更。
+兼容 Cursor (postToolUse/Shell) 和 Claude Code (PostToolUse/Bash)。
 
 在 git pull 完成后，读取新增的决策记录文件，
 按重要度排序后格式化为分层文本，注入对话上下文。
@@ -12,17 +13,22 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compat import HookIO
 
-def is_git_pull(tool_input: dict) -> bool:
-    command = ""
-    if isinstance(tool_input, dict):
-        command = tool_input.get("command", "")
-    elif isinstance(tool_input, str):
-        command = tool_input
+
+def is_git_pull(hook):
+    command = hook.get_command()
+    if not command:
+        tool_input = hook.payload.get("tool_input", {})
+        if isinstance(tool_input, str):
+            command = tool_input
+        elif isinstance(tool_input, dict):
+            command = tool_input.get("command", "")
     return bool(re.match(r"^git\s+pull", command.strip()))
 
 
-def get_new_decision_files(cwd: str) -> list:
+def get_new_decision_files(cwd):
     try:
         result = subprocess.run(
             ["git", "log", "ORIG_HEAD..HEAD", "--name-only", "--pretty=format:"],
@@ -37,7 +43,7 @@ def get_new_decision_files(cwd: str) -> list:
         return []
 
 
-def load_decision_file(cwd: str, rel_path: str) -> dict:
+def load_decision_file(cwd, rel_path):
     fpath = os.path.join(cwd, rel_path)
     try:
         with open(fpath, "r", encoding="utf-8") as f:
@@ -46,7 +52,7 @@ def load_decision_file(cwd: str, rel_path: str) -> dict:
         return {}
 
 
-def format_review(records: list) -> str:
+def format_review(records):
     if not records:
         return ""
 
@@ -127,29 +133,17 @@ def format_review(records: list) -> str:
 
 
 def main():
-    payload = json.load(sys.stdin)
-    tool_input = payload.get("tool_input", {})
+    hook = HookIO()
 
-    if isinstance(tool_input, str):
-        try:
-            tool_input = json.loads(tool_input)
-        except json.JSONDecodeError:
-            tool_input = {"command": tool_input}
-
-    if not is_git_pull(tool_input):
-        json.dump({}, sys.stdout)
+    if not is_git_pull(hook):
+        hook.empty()
         return
 
-    workspace_roots = payload.get("workspace_roots", [])
-    cwd = payload.get("cwd", ".")
-    if isinstance(tool_input, dict):
-        cwd = tool_input.get("working_directory", tool_input.get("cwd", cwd))
-    project_root = workspace_roots[0] if workspace_roots else os.environ.get("CURSOR_PROJECT_DIR", cwd)
-
+    project_root = hook.get_project_root()
     new_files = get_new_decision_files(project_root)
 
     if not new_files:
-        json.dump({}, sys.stdout)
+        hook.empty()
         return
 
     records = []
@@ -162,9 +156,9 @@ def main():
     review_text = format_review(records)
 
     if review_text:
-        json.dump({"additional_context": review_text}, sys.stdout, ensure_ascii=False)
+        hook.additional_context(review_text)
     else:
-        json.dump({}, sys.stdout)
+        hook.empty()
 
 
 if __name__ == "__main__":

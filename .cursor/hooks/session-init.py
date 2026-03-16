@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """
-Cursor Hook: 会话启动时注入团队决策上下文。
-
-读取 .teamwork/decisions/ 下最近的决策记录，
-对每个 decision_key 取最新 active 版本，格式化后注入会话。
+Hook: 会话启动时注入团队决策上下文。
+兼容 Cursor (sessionStart) 和 Claude Code (SessionStart)。
 """
 
 import json
 import os
 import subprocess
 import sys
-from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compat import HookIO
 
 
-def find_project_root(workspace_roots: list) -> str:
-    if workspace_roots:
-        return workspace_roots[0]
-    return os.environ.get("CURSOR_PROJECT_DIR", ".")
-
-
-def resolve_current_user(payload: dict, config: dict, project_root: str) -> dict:
-    """按优先级识别当前用户：user_email → git email → git name。"""
+def resolve_current_user(hook, config, project_root):
     members = config.get("team_members", [])
     email_map = {m.get("email", "").lower(): m for m in members if m.get("email")}
 
-    user_email = payload.get("user_email") or os.environ.get("CURSOR_USER_EMAIL", "")
+    user_email = hook.get_user_email()
     if user_email and user_email.lower() in email_map:
         m = email_map[user_email.lower()]
-        return {"name": m["name"], "role": m.get("role", ""), "email": user_email, "source": "cursor_account"}
+        return {"name": m["name"], "role": m.get("role", ""), "email": user_email, "source": "account"}
 
     try:
         git_email = subprocess.run(
@@ -60,7 +53,7 @@ def resolve_current_user(payload: dict, config: dict, project_root: str) -> dict
     return {"name": "未知用户", "role": "", "email": "", "source": "unknown"}
 
 
-def load_config(project_root: str) -> dict:
+def load_config(project_root):
     config_path = os.path.join(project_root, ".teamwork", "config.json")
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -69,7 +62,7 @@ def load_config(project_root: str) -> dict:
         return {}
 
 
-def load_decisions(project_root: str) -> list:
+def load_decisions(project_root):
     decisions_dir = os.path.join(project_root, ".teamwork", "decisions")
     if not os.path.isdir(decisions_dir):
         return []
@@ -89,7 +82,7 @@ def load_decisions(project_root: str) -> list:
     return records
 
 
-def get_active_decisions(records: list) -> dict:
+def get_active_decisions(records):
     superseded_ids = set()
     for rec in records:
         for entry in rec.get("entries", []):
@@ -109,7 +102,7 @@ def get_active_decisions(records: list) -> dict:
     return active
 
 
-def format_context(active: dict, config: dict, current_user: dict) -> str:
+def format_context(active, config, current_user):
     lines = ["## 团队决策上下文\n"]
 
     lines.append(f"**当前用户：{current_user['name']}（{current_user.get('role') or '角色未配置'}）**\n")
@@ -143,21 +136,17 @@ def format_context(active: dict, config: dict, current_user: dict) -> str:
 
 
 def main():
-    payload = json.load(sys.stdin)
-    workspace_roots = payload.get("workspace_roots", [])
-    project_root = find_project_root(workspace_roots)
+    hook = HookIO()
+    project_root = hook.get_project_root()
 
     config = load_config(project_root)
-    current_user = resolve_current_user(payload, config, project_root)
+    current_user = resolve_current_user(hook, config, project_root)
     records = load_decisions(project_root)
     active = get_active_decisions(records[:10])
     context = format_context(active, config, current_user)
 
-    output = {"env": {"TEAMWORK_DIR": ".teamwork", "TEAMWORK_USER": current_user["name"]}}
-    if context:
-        output["additional_context"] = context
-
-    json.dump(output, sys.stdout, ensure_ascii=False)
+    env = {"TEAMWORK_DIR": ".teamwork", "TEAMWORK_USER": current_user["name"]}
+    hook.context(text=context, env=env)
 
 
 if __name__ == "__main__":

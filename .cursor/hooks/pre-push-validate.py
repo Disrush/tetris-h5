@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Cursor Hook: 推送前校验决策记录完整性。
+Hook: 推送前校验决策记录完整性。
+兼容 Cursor (beforeShellExecution) 和 Claude Code (PreToolUse/Bash)。
 
 检查待推送的 commit 中：
 1. 非 [skip decision] 的 commit 是否有对应的决策记录文件变更
@@ -9,12 +10,14 @@ Cursor Hook: 推送前校验决策记录完整性。
 
 import json
 import os
-import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compat import HookIO
 
-def get_unpushed_commits(cwd: str) -> list:
+
+def get_unpushed_commits(cwd):
     for ref in ["origin/HEAD..HEAD", "@{u}..HEAD"]:
         try:
             result = subprocess.run(
@@ -33,7 +36,7 @@ def get_unpushed_commits(cwd: str) -> list:
     return []
 
 
-def get_commit_files(cwd: str, commit_hash: str) -> list:
+def get_commit_files(cwd, commit_hash):
     try:
         result = subprocess.run(
             ["git", "diff-tree", "--no-commit-id", "-r", "--name-only", commit_hash],
@@ -44,7 +47,7 @@ def get_commit_files(cwd: str, commit_hash: str) -> list:
         return []
 
 
-def check_decisions(cwd: str, commits: list) -> list:
+def check_decisions(cwd, commits):
     issues = []
 
     for commit_hash, message in commits:
@@ -55,7 +58,7 @@ def check_decisions(cwd: str, commits: list) -> list:
 
         files = get_commit_files(cwd, commit_hash)
         has_code_changes = any(
-            not f.startswith(".teamwork/") and not f.startswith(".cursor/")
+            not f.startswith(".teamwork/") and not f.startswith(".cursor/") and not f.startswith(".claude/")
             for f in files
         )
         has_decision_file = any(
@@ -90,37 +93,36 @@ def check_decisions(cwd: str, commits: list) -> list:
 
 
 def main():
-    payload = json.load(sys.stdin)
-    command = payload.get("command", "")
-    cwd = payload.get("cwd", ".")
+    hook = HookIO()
+    command = hook.get_command()
+    cwd = hook.get_cwd()
 
     if "git push" not in command:
-        json.dump({"permission": "allow"}, sys.stdout)
+        hook.allow()
         return
 
     commits = get_unpushed_commits(cwd)
     if not commits:
-        json.dump({"permission": "allow"}, sys.stdout)
+        hook.allow()
         return
 
     issues = check_decisions(cwd, commits)
 
     if issues:
         issue_text = "\n".join(f"  - {issue}" for issue in issues)
-        json.dump({
-            "permission": "deny",
-            "user_message": "推送被拦截：决策记录不完整，请补充后再推送",
-            "agent_message": (
+        hook.deny(
+            user_message="推送被拦截：决策记录不完整，请补充后再推送",
+            agent_message=(
                 "⚠️ Git push 被拦截，决策记录校验未通过：\n\n"
                 f"{issue_text}\n\n"
                 "请修复以上问题后重新推送：\n"
                 "- 缺少决策记录的 commit：请生成决策记录文件后 amend 或新增 commit\n"
                 "- 大变更缺少背景：请补充 change_background 字段"
             )
-        }, sys.stdout, ensure_ascii=False)
+        )
         return
 
-    json.dump({"permission": "allow"}, sys.stdout)
+    hook.allow()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Cursor Hook: 提交前决策记录生成器。
+Hook: 提交前决策记录生成器。
+兼容 Cursor (beforeShellExecution) 和 Claude Code (PreToolUse/Bash)。
 
-拦截 git commit，要求 Agent 基于对话内容和草稿生成结构化的团队决策记录，
+拦截 git commit，要求 Agent 生成结构化的团队决策记录，
 让用户审阅确认后保存到 .teamwork/decisions/，再允许提交。
-
 通过 flag 文件机制避免二次拦截导致死循环。
 """
 
@@ -13,11 +13,13 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compat import HookIO
+
 FLAG_DIR = "/tmp/cursor-hooks"
 
 
-def resolve_current_user(payload: dict, cwd: str) -> dict:
-    """按优先级识别当前用户：user_email → git email → git name。"""
+def resolve_current_user(hook, cwd):
     config_path = os.path.join(cwd, ".teamwork", "config.json")
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -28,7 +30,7 @@ def resolve_current_user(payload: dict, cwd: str) -> dict:
     members = config.get("team_members", [])
     email_map = {m.get("email", "").lower(): m for m in members if m.get("email")}
 
-    user_email = payload.get("user_email") or os.environ.get("CURSOR_USER_EMAIL", "")
+    user_email = hook.get_user_email()
     if user_email and user_email.lower() in email_map:
         m = email_map[user_email.lower()]
         return {"name": m["name"], "role": m.get("role", ""), "email": user_email}
@@ -63,12 +65,12 @@ def resolve_current_user(payload: dict, cwd: str) -> dict:
     return {"name": "未知用户", "role": "", "email": ""}
 
 
-def get_flag_path(conversation_id: str) -> str:
+def get_flag_path(conversation_id):
     os.makedirs(FLAG_DIR, exist_ok=True)
     return os.path.join(FLAG_DIR, f"decision-{conversation_id}")
 
 
-def get_staged_diff(cwd: str) -> tuple:
+def get_staged_diff(cwd):
     try:
         stat = subprocess.run(
             ["git", "diff", "--cached", "--stat"],
@@ -85,12 +87,12 @@ def get_staged_diff(cwd: str) -> tuple:
         return "", ""
 
 
-def should_skip(command: str) -> bool:
+def should_skip(command):
     skip_flags = ["--amend", "[skip decision]", "[no decision]", "merge"]
     return any(flag in command for flag in skip_flags)
 
 
-def check_draft_exists(cwd: str) -> str:
+def check_draft_exists(cwd):
     draft_path = os.path.join(cwd, ".teamwork", "drafts", "current.json")
     if os.path.exists(draft_path):
         try:
@@ -103,7 +105,7 @@ def check_draft_exists(cwd: str) -> str:
     return ""
 
 
-def list_existing_keys(cwd: str) -> str:
+def list_existing_keys(cwd):
     decisions_dir = os.path.join(cwd, ".teamwork", "decisions")
     if not os.path.isdir(decisions_dir):
         return "（暂无已有决策记录）"
@@ -127,7 +129,7 @@ def list_existing_keys(cwd: str) -> str:
     return "已有 decision_key 列表：" + ", ".join(sorted(keys))
 
 
-def ensure_teamwork_dir(cwd: str):
+def ensure_teamwork_dir(cwd):
     for d in [".teamwork", ".teamwork/decisions", ".teamwork/drafts"]:
         os.makedirs(os.path.join(cwd, d), exist_ok=True)
     config_path = os.path.join(cwd, ".teamwork", "config.json")
@@ -137,13 +139,13 @@ def ensure_teamwork_dir(cwd: str):
 
 
 def main():
-    payload = json.load(sys.stdin)
-    command = payload.get("command", "")
-    cwd = payload.get("cwd", ".")
-    conversation_id = payload.get("conversation_id", "unknown")
+    hook = HookIO()
+    command = hook.get_command()
+    cwd = hook.get_cwd()
+    conversation_id = hook.get_conversation_id()
 
     if "git commit" not in command or should_skip(command):
-        json.dump({"permission": "allow"}, sys.stdout)
+        hook.allow()
         return
 
     flag_path = get_flag_path(conversation_id)
@@ -153,13 +155,13 @@ def main():
             os.remove(flag_path)
         except OSError:
             pass
-        json.dump({"permission": "allow"}, sys.stdout)
+        hook.allow()
         return
 
     diff_stat, diff_detail = get_staged_diff(cwd)
 
     if not diff_stat:
-        json.dump({"permission": "allow"}, sys.stdout)
+        hook.allow()
         return
 
     ensure_teamwork_dir(cwd)
@@ -175,7 +177,7 @@ def main():
     draft_hint = check_draft_exists(cwd)
     existing_keys = list_existing_keys(cwd)
 
-    user = resolve_current_user(payload, cwd)
+    user = resolve_current_user(hook, cwd)
     user_line = f"**当前用户：{user['name']}（{user['role'] or '角色未配置'}）**"
     if user['email']:
         user_line += f"  email: {user['email']}"
@@ -218,13 +220,10 @@ def main():
         f"   - 重新执行原 commit 命令：`{command}`"
     )
 
-    result = {
-        "permission": "deny",
-        "user_message": "Hook: 请先生成团队决策记录再提交...",
-        "agent_message": agent_msg
-    }
-
-    json.dump(result, sys.stdout, ensure_ascii=False)
+    hook.deny(
+        user_message="Hook: 请先生成团队决策记录再提交...",
+        agent_message=agent_msg
+    )
 
 
 if __name__ == "__main__":
