@@ -42,7 +42,16 @@ def get_commit_files(cwd, commit_hash):
             ["git", "diff-tree", "--no-commit-id", "-r", "--name-only", commit_hash],
             cwd=cwd, capture_output=True, text=True, timeout=10
         )
-        return [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+        files = []
+        for f in result.stdout.strip().split("\n"):
+            f = f.strip()
+            if not f:
+                continue
+            # Remove quotes that git adds for paths with special characters
+            if f.startswith('"') and f.endswith('"'):
+                f = f[1:-1]
+            files.append(f)
+        return files
     except Exception:
         return []
 
