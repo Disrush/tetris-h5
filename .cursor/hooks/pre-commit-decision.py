@@ -12,57 +12,33 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from compat import HookIO
+from compat import HookIO, resolve_current_user
+
+
+def resolve_current_user_simple(hook, cwd):
+    """Wrapper that returns only the user dict (for backward compat)."""
+    user, _ = resolve_current_user(hook, cwd)
+    return user
 
 FLAG_DIR = "/tmp/cursor-hooks"
+FLAG_TTL_SECONDS = 600
 
 
-def resolve_current_user(hook, cwd):
-    config_path = os.path.join(cwd, ".teamwork", "config.json")
+def write_flag(flag_path):
+    with open(flag_path, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def is_flag_valid(flag_path):
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-
-    members = config.get("team_members", [])
-    email_map = {m.get("email", "").lower(): m for m in members if m.get("email")}
-
-    user_email = hook.get_user_email()
-    if user_email and user_email.lower() in email_map:
-        m = email_map[user_email.lower()]
-        return {"name": m["name"], "role": m.get("role", ""), "email": user_email}
-
-    try:
-        git_email = subprocess.run(
-            ["git", "config", "user.email"], cwd=cwd,
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-        if git_email and git_email.lower() in email_map:
-            m = email_map[git_email.lower()]
-            return {"name": m["name"], "role": m.get("role", ""), "email": git_email}
-    except Exception:
-        pass
-
-    try:
-        git_name = subprocess.run(
-            ["git", "config", "user.name"], cwd=cwd,
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-        name_map = {m["name"]: m for m in members}
-        if git_name and git_name in name_map:
-            m = name_map[git_name]
-            return {"name": m["name"], "role": m.get("role", ""), "email": ""}
-        if git_name:
-            return {"name": git_name, "role": "", "email": ""}
-    except Exception:
-        pass
-
-    if user_email:
-        return {"name": user_email.split("@")[0], "role": "", "email": user_email}
-    return {"name": "未知用户", "role": "", "email": ""}
+        with open(flag_path, "r", encoding="utf-8") as f:
+            created_at = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return time.time() - created_at < FLAG_TTL_SECONDS
 
 
 def get_flag_path(conversation_id):
@@ -149,14 +125,36 @@ def main():
         return
 
     flag_path = get_flag_path(conversation_id)
+    user = resolve_current_user_simple(hook, cwd)
 
-    if os.path.exists(flag_path):
+    if user.get("source") in {"unregistered", "unknown"}:
         try:
             os.remove(flag_path)
         except OSError:
             pass
-        hook.allow()
+        hook.deny(
+            user_message="Hook: 请先完成团队成员注册...",
+            agent_message=(
+                "⚠️ 当前用户尚未注册到项目团队配置中，暂不能提交。\n\n"
+                f"检测到的身份：name={user.get('name') or 'not set'}, email={user.get('email') or 'not set'}\n"
+                "请先告诉我你的显示名和团队角色，我会帮你写入 .teamwork/config.json。\n"
+                "完成注册并提交配置后，再重新执行当前 commit。"
+            )
+        )
         return
+
+    if os.path.exists(flag_path):
+        if is_flag_valid(flag_path):
+            try:
+                os.remove(flag_path)
+            except OSError:
+                pass
+            hook.allow()
+            return
+        try:
+            os.remove(flag_path)
+        except OSError:
+            pass
 
     diff_stat, diff_detail = get_staged_diff(cwd)
 
@@ -166,8 +164,7 @@ def main():
 
     ensure_teamwork_dir(cwd)
 
-    with open(flag_path, "w") as f:
-        f.write(conversation_id)
+    write_flag(flag_path)
 
     max_len = 3000
     diff_preview = diff_detail[:max_len]
@@ -177,7 +174,7 @@ def main():
     draft_hint = check_draft_exists(cwd)
     existing_keys = list_existing_keys(cwd)
 
-    user = resolve_current_user(hook, cwd)
+    user = resolve_current_user_simple(hook, cwd)
     user_line = f"**当前用户：{user['name']}（{user['role'] or '角色未配置'}）**"
     if user['email']:
         user_line += f"  email: {user['email']}"
